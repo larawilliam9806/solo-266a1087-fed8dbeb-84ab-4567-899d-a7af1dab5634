@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>地铁首程客流 · 差分隐私查询</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+         margin: 0; background: #f4f6f8; color: #1f2933; }
+  header { background: #0f4c81; color: #fff; padding: 16px 24px; }
+  header h1 { margin: 0; font-size: 20px; }
+  header p { margin: 4px 0 0; font-size: 13px; opacity: .85; }
+  main { max-width: 960px; margin: 24px auto; padding: 0 16px;
+         display: grid; gap: 20px; }
+  section { background: #fff; border-radius: 10px; padding: 20px 24px;
+            box-shadow: 0 1px 3px rgba(15, 76, 129, .12); }
+  h2 { margin: 0 0 12px; font-size: 17px; color: #0f4c81; }
+  label { display: block; font-size: 13px; margin: 10px 0 4px; color: #52606d; }
+  input[type=date], input[type=file], select {
+    width: 100%; padding: 8px; border: 1px solid #cbd2d9; border-radius: 6px;
+    font-size: 14px; background: #fff; }
+  select[multiple] { min-height: 120px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  button { margin-top: 14px; padding: 9px 22px; border: 0; border-radius: 6px;
+           background: #0f4c81; color: #fff; font-size: 14px; cursor: pointer; }
+  button:hover { background: #0b3a63; }
+  .msg { margin-top: 12px; padding: 10px 12px; border-radius: 6px; font-size: 14px;
+         display: none; white-space: pre-wrap; }
+  .msg.ok  { display: block; background: #e3f2e9; color: #1c6b3c; }
+  .msg.err { display: block; background: #fdecea; color: #b3261e; }
+  .result { margin-top: 14px; font-size: 15px; display: none; }
+  .result b { font-size: 26px; color: #0f4c81; }
+  .badges { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+  .badge { background: #eef2f6; border-radius: 999px; padding: 5px 14px;
+           font-size: 13px; color: #334e68; }
+  .badge.locked { background: #fdecea; color: #b3261e; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #e4e7eb; }
+  th { color: #52606d; font-weight: 600; }
+  .hint { font-size: 12px; color: #7b8794; margin-top: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>地铁每日首程客流 · 差分隐私查询平台</h1>
+  <p>每次新查询添加 Laplace(0, 2) 噪声并扣除 {{ query_cost }} 隐私预算,每日总额 {{ daily_budget }};相同查询复用原结果,不再扣费。查询页只显示加噪结果。</p>
+</header>
+<main>
+  <section>
+    <h2>① 上传每日源数据(CSV:乘客ID, 进站, 出站;每位乘客仅一行)</h2>
+    <form id="uploadForm">
+      <label for="upDate">数据日期</label>
+      <input type="date" id="upDate" required>
+      <label for="upFile">CSV 文件(UTF-8)</label>
+      <input type="file" id="upFile" accept=".csv,text/csv" required>
+      <button type="submit">上传 / 整日替换</button>
+    </form>
+    <div class="msg" id="uploadMsg"></div>
+    <div class="hint">首个成功查询会锁定当天源数据;锁定前可整日替换,锁定后拒绝替换。</div>
+  </section>
+
+  <section>
+    <h2>② 查询客流(仅显示加噪结果)</h2>
+    <label for="qDate">数据日期</label>
+    <input type="date" id="qDate">
+    <div class="row">
+      <div>
+        <label>进站集合(按住 Ctrl/⌘ 多选)</label>
+        <select id="inSel" multiple></select>
+      </div>
+      <div>
+        <label>出站集合(按住 Ctrl/⌘ 多选)</label>
+        <select id="outSel" multiple></select>
+      </div>
+    </div>
+    <button id="queryBtn" type="button">查询</button>
+    <div class="msg" id="queryMsg"></div>
+    <div class="result" id="queryResult"></div>
+  </section>
+
+  <section>
+    <h2>③ 当日状态与已发布结果</h2>
+    <div class="badges" id="statusBadges"></div>
+    <table id="historyTable">
+      <thead><tr><th>#</th><th>进站集合</th><th>出站集合</th><th>加噪人数</th><th>发布时间(UTC)</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+
+function showMsg(el, text, ok) {
+  el.textContent = text;
+  el.className = "msg " + (ok ? "ok" : "err");
+}
+
+async function refreshStations() {
+  const date = $("qDate").value;
+  $("inSel").innerHTML = ""; $("outSel").innerHTML = "";
+  if (!date) return;
+  const res = await fetch("/api/stations?date=" + encodeURIComponent(date));
+  const data = await res.json();
+  if (!data.ok) return;
+  for (const s of data.stations) {
+    $("inSel").add(new Option(s, s));
+    $("outSel").add(new Option(s, s));
+  }
+}
+
+async function refreshStatus() {
+  const date = $("qDate").value;
+  if (!date) return;
+  const [stRes, qRes] = await Promise.all([
+    fetch("/api/status?date=" + encodeURIComponent(date)),
+    fetch("/api/queries?date=" + encodeURIComponent(date)),
+  ]);
+  const st = await stRes.json(), q = await qRes.json();
+  if (st.ok) {
+    $("statusBadges").innerHTML =
+      `<span class="badge">源数据行数:${st.rows}</span>` +
+      `<span class="badge">预算:已用 ${st.budget_spent} / ${st.daily_budget}(剩余 ${st.budget_remaining})</span>` +
+      `<span class="badge ${st.locked ? "locked" : ""}">${st.locked ? "源数据已锁定" : "源数据未锁定(可替换)"}</span>`;
+  }
+  const tbody = $("historyTable").querySelector("tbody");
+  tbody.innerHTML = "";
+  if (q.ok) q.queries.forEach((r, i) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${i + 1}</td><td>${r.in_stations.join("、")}</td>` +
+      `<td>${r.out_stations.join("、")}</td><td>${r.noisy_count.toFixed(4)}</td>` +
+      `<td>${r.created_at}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+$("uploadForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const fd = new FormData();
+  fd.append("date", $("upDate").value);
+  fd.append("file", $("upFile").files[0]);
+  const res = await fetch("/upload", { method: "POST", body: fd });
+  const data = await res.json();
+  showMsg($("uploadMsg"), data.ok ? data.message : ("上传失败:" + data.error), data.ok);
+  if (data.ok) { $("qDate").value = $("upDate").value; refreshStations(); refreshStatus(); }
+});
+
+$("queryBtn").addEventListener("click", async () => {
+  const pick = sel => Array.from(sel.selectedOptions).map(o => o.value);
+  const body = {
+    date: $("qDate").value,
+    in_stations: pick($("inSel")),
+    out_stations: pick($("outSel")),
+  };
+  const res = await fetch("/query", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  const msg = $("queryMsg"), out = $("queryResult");
+  if (data.ok) {
+    msg.className = "msg"; msg.style.display = "none";
+    out.style.display = "block";
+    out.innerHTML = `匹配人数(加噪后):<b>${data.noisy_count.toFixed(4)}</b>` +
+      `<div class="hint">${data.cached ? "相同查询,复用已发布结果,未扣费。" : "新查询,已扣 0.5 隐私预算。"}` +
+      (data.budget_remaining !== undefined ? ` 当日剩余预算:${data.budget_remaining}` : "") + `</div>`;
+  } else {
+    out.style.display = "none";
+    showMsg(msg, "查询失败:" + data.error, false);
+  }
+  refreshStatus();
+});
+
+$("qDate").addEventListener("change", () => { refreshStations(); refreshStatus(); });
+const today = new Date().toISOString().slice(0, 10);
+$("upDate").value = today; $("qDate").value = today;
+refreshStations(); refreshStatus();
+</script>
+</body>
+</html>
